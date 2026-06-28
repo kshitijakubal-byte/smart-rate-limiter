@@ -221,3 +221,4 @@ Migrations are run **manually** whenever the schema changes — there's no auto-
 -- - add nullable phone_number to users
 -- - add nullable user_id FK to otp_requests
 -- - support both guest (phone-only) and logged-in OTP flows
+-- - support Expired OTPs status update via cron
