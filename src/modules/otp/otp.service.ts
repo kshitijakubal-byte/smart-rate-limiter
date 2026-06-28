@@ -1,3 +1,4 @@
+import { PoolClient } from "pg";
 import { pool } from "../../config/db";
 import { AppError } from "../../utils/AppError";
 import { logger } from "../../utils/logger";
@@ -6,7 +7,12 @@ import { ResendOtpInput, SendOtpInput } from "./otp.schema";
 const OTP_EXPIRY_MINUTES = 5;
 const OTP_LENGTH = 6;
 
-export type OtpStatus = "pending" | "verified" | "cancelled" | "expired";
+export type OtpStatus =
+  | "pending"
+  | "verified"
+  | "expired"
+  | "cancelled"
+  | "superseded";
 
 export interface OtpRequest {
   id: number;
@@ -17,6 +23,10 @@ export interface OtpRequest {
   created_at: Date;
   expires_at: Date;
 }
+
+// TODO: Add a cron job or stored procedure to formally mark rows as 'expired'
+// once expires_at passes. Until then, treat pending rows with expires_at <= now()
+// as inactive at query time.
 
 function generateOtpCode(): string {
   const max = 10 ** OTP_LENGTH;
@@ -41,7 +51,34 @@ function toPublicOtpRequest(row: OtpRequest) {
   };
 }
 
+async function findActivePendingByPhone(
+  phoneNumber: string,
+  client: PoolClient | typeof pool = pool
+): Promise<OtpRequest | undefined> {
+  const result = await client.query<OtpRequest>(
+    `SELECT *
+     FROM otp_requests
+     WHERE phone_number = $1
+       AND status = 'pending'
+       AND expires_at > NOW()
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [phoneNumber]
+  );
+
+  return result.rows[0];
+}
+
 export async function sendOtp(input: SendOtpInput) {
+  const existingActive = await findActivePendingByPhone(input.phoneNumber);
+
+  if (existingActive) {
+    throw new AppError(
+      409,
+      "An OTP was already sent. Please wait for it to expire or use resend."
+    );
+  }
+
   const code = generateOtpCode();
   const expiresAt = getExpiryTimestamp();
 
@@ -64,6 +101,7 @@ export async function sendOtp(input: SendOtpInput) {
   return toPublicOtpRequest(otpRequest);
 }
 
+//GET OTP STATUS
 export async function getOtpStatus(id: number) {
   const result = await pool.query<OtpRequest>(
     `SELECT *
@@ -81,8 +119,9 @@ export async function getOtpStatus(id: number) {
   return toPublicOtpRequest(otpRequest);
 }
 
+//RESEND OTP
 export async function resendOtp(input: ResendOtpInput) {
-  let otpRequest: OtpRequest | undefined;
+  let phoneNumber: string | undefined = input.phoneNumber;
 
   if (input.otpRequestId) {
     const result = await pool.query<OtpRequest>(
@@ -91,52 +130,81 @@ export async function resendOtp(input: ResendOtpInput) {
        WHERE id = $1`,
       [input.otpRequestId]
     );
-    otpRequest = result.rows[0];
-  } else if (input.phoneNumber) {
-    const result = await pool.query<OtpRequest>(
-      `SELECT *
-       FROM otp_requests
-       WHERE phone_number = $1 AND status = 'pending'
-       ORDER BY created_at DESC
-       LIMIT 1`,
-      [input.phoneNumber]
-    );
-    otpRequest = result.rows[0];
+    const byId = result.rows[0];
+
+    if (input.phoneNumber) {
+      if (!byId) {
+        throw new AppError(404, "OTP request not found");
+      }
+      if (byId.phone_number !== input.phoneNumber) {
+        throw new AppError(400, "Phone number does not match the OTP request");
+      }
+      phoneNumber = input.phoneNumber;
+    } else if (byId) {
+      phoneNumber = byId.phone_number;
+    } else {
+      throw new AppError(404, "OTP request not found");
+    }
   }
 
-  if (!otpRequest) {
-    throw new AppError(404, "Pending OTP request not found");
+  if (!phoneNumber) {
+    throw new AppError(404, "No active OTP request to resend.");
   }
 
-  if (otpRequest.status !== "pending") {
-    throw new AppError(400, "Only pending OTP requests can be resent");
+  const activeOtp = await findActivePendingByPhone(phoneNumber);
+
+  if (!activeOtp) {
+    throw new AppError(404, "No active OTP request to resend.");
+  }
+
+  if (input.otpRequestId && activeOtp.id !== input.otpRequestId) {
+    throw new AppError(404, "No active OTP request to resend.");
   }
 
   const code = generateOtpCode();
   const expiresAt = getExpiryTimestamp();
 
-  const result = await pool.query<OtpRequest>(
-    `UPDATE otp_requests
-     SET code = $1,
-         expires_at = $2,
-         attempt_count = 0
-     WHERE id = $3
-     RETURNING *`,
-    [code, expiresAt, otpRequest.id]
-  );
+  const client = await pool.connect();
 
-  const updated = result.rows[0];
+  try {
+    await client.query("BEGIN");
 
-  logger.info("OTP regenerated (not sent via SMS)", {
-    phoneNumber: updated.phone_number,
-    otpRequestId: updated.id,
-    code,
-    expiresAt,
-  });
+    await client.query(
+      `UPDATE otp_requests
+       SET status = 'superseded'
+       WHERE id = $1`,
+      [activeOtp.id]
+    );
 
-  return toPublicOtpRequest(updated);
+    const insertResult = await client.query<OtpRequest>(
+      `INSERT INTO otp_requests (phone_number, code, status, expires_at)
+       VALUES ($1, $2, 'pending', $3)
+       RETURNING *`,
+      [phoneNumber, code, expiresAt]
+    );
+
+    await client.query("COMMIT");
+
+    const newOtpRequest = insertResult.rows[0];
+
+    logger.info("OTP regenerated (not sent via SMS)", {
+      phoneNumber,
+      otpRequestId: newOtpRequest.id,
+      supersededOtpRequestId: activeOtp.id,
+      code,
+      expiresAt,
+    });
+
+    return toPublicOtpRequest(newOtpRequest);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
+//CANCEL OTP
 export async function cancelOtp(id: number) {
   const result = await pool.query<OtpRequest>(
     `SELECT *
@@ -153,12 +221,14 @@ export async function cancelOtp(id: number) {
 
   // TODO: Verify the OTP request belongs to the requesting user/context before cancelling.
 
-  if (otpRequest.status === "cancelled") {
-    return toPublicOtpRequest(otpRequest);
-  }
+  const isActivePending =
+    otpRequest.status === "pending" && otpRequest.expires_at > new Date();
 
-  if (otpRequest.status !== "pending") {
-    throw new AppError(400, "Only pending OTP requests can be cancelled");
+  if (!isActivePending) {
+    throw new AppError(
+      400,
+      "OTP request is not active and cannot be cancelled."
+    );
   }
 
   const updatedResult = await pool.query<OtpRequest>(

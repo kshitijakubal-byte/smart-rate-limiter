@@ -6,7 +6,7 @@ import { AppError } from "../../utils/AppError";
 import { LoginInput, RegisterInput } from "./auth.schema";
 
 const SALT_ROUNDS = 10;
-
+// need to understand UserRow (interface) type
 interface UserRow {
   id: number;
   name: string;
@@ -15,6 +15,8 @@ interface UserRow {
   created_at: Date;
 }
 
+//REGISTER
+// need to understand input: RegisterInput type | difference between input and schema
 export async function registerUser(input: RegisterInput) {
   const passwordHash = await bcrypt.hash(input.password, SALT_ROUNDS);
 
@@ -39,7 +41,7 @@ export async function registerUser(input: RegisterInput) {
     throw err;
   }
 }
-
+//LOGIN
 export async function loginUser(input: LoginInput) {
   const result = await pool.query<UserRow>(
     `SELECT id, name, email, password_hash, created_at

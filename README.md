@@ -216,3 +216,8 @@ Migrations are run **manually** whenever the schema changes — there's no auto-
 - **No rate-limiting packages yet** — intentionally excluded from Phase 1 scaffolding. These will be added manually as Phase 2 begins, to keep the learning process hands-on rather than dependency-driven.
 - **`resend` shares risk profile with `send`** — these two endpoints should eventually share the same rate-limit bucket (keyed by phone number), not be treated as independently-limited routes.
 - **Ownership check on `cancel`** is intentionally left as a TODO in Phase 1 — it's an authorization concern, not a rate-limiting one, but it's flagged here so it isn't forgotten.
+
+-- TODO: when adding real SMS provider, revisit schema:
+-- - add nullable phone_number to users
+-- - add nullable user_id FK to otp_requests
+-- - support both guest (phone-only) and logged-in OTP flows

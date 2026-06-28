@@ -1,5 +1,5 @@
 import { NextFunction, Request, Response } from "express";
-
+// need to understand AsyncRequestHandler type
 type AsyncRequestHandler = (
   req: Request,
   res: Response,
